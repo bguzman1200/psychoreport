@@ -1,0 +1,8 @@
+streamlit
+pandas
+openai
+python-docx
+fuzzywuzzy
+python-Levenshtein
+plotly
+openpyxl
