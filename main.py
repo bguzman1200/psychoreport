@@ -1,323 +1,249 @@
 import streamlit as st
 import pandas as pd
-import re
-from fuzzywuzzy import process, fuzz
-import plotly.express as px
-from openai import OpenAI
+from fuzzywuzzy import fuzz, process
 from docx import Document
-from io import BytesIO
-import random
+from docx.shared import Pt
+import io
+from openai import OpenAI
 
-# --- 1. CONFIGURATION & SETUP ---
-st.set_page_config(
-    page_title="PsychoReport.ai",
-    layout="wide",
-    page_icon="🧠"
-)
+# -----------------------------------------------------------------------------
+# CONSTANTS & CONFIGURATION
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="PsychoReport.ai", page_icon="🧠", layout="wide")
 
-# Initialize Session State for API Key if not present
-if "api_key" not in st.session_state:
-    st.session_state["api_key"] = ""
-
-# --- 2. DOMAIN KNOWLEDGE BASE ---
-# Keywords for Fuzzy Matching
+# Domain Keywords for Fuzzy Matching
 DOMAINS = {
-    "Inhibition": ["interrupt", "blurt", "turn", "stop", "calm", "yell", "impulsive", "talk"],
-    "Shift/Flexibility": ["stuck", "transition", "change", "new", "routine", "flexible", "adapt"],
-    "Organization/Plan": ["messy", "lose", "backpack", "materials", "time", "due", "plan", "forget"]
+    "Behavioral Regulation": [
+        "Blurts", "Interrupts", "Rushes", "Waiting", "Overreacts", 
+        "Calm", "Transition", "Stuck", "Rigid"
+    ],
+    "Cognitive Regulation": [
+        "Distracted", "Redirection", "Zoning", "Track", "Multi-step", 
+        "Forgets", "Recall", "Prompting", "Procrastinates", "Check work"
+    ],
+    "Organization": [
+        "Desk", "Messy", "Materials", "Lose items", "Break down", 
+        "Overwhelmed", "Underestimates", "Time"
+    ]
 }
 
-# Likert Scale Mapping
-LIKERT_MAP = {
-    "never": 1, "rarely": 1, "1": 1,
-    "sometimes": 2, "2": 2,
-    "often": 3, "3": 3,
-    "very often": 4, "very": 4, "4": 4,
-    "almost always": 4, "5": 4 # Handling potential 5-point scales by capping or mapping high
-}
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
 
-# --- 3. HELPER FUNCTIONS ---
-
-def clean_header(header_text):
-    """
-    Extracts the core behavior from a Google Form header.
-    Priority: Text inside brackets [], otherwise last 5 words.
-    """
-    # Regex to find text inside brackets
-    match = re.search(r'\[(.*?)\]', str(header_text))
-    if match:
-        return match.group(1).strip()
-    
-    # Fallback: Take last 5 words
-    words = str(header_text).split()
-    return " ".join(words[-5:])
-
-def map_domain(cleaned_header):
-    """
-    Maps a cleaned header string to a Domain using Fuzzy Matching.
-    """
-    best_score = 0
-    best_domain = "Uncategorized"
-    
-    for domain, keywords in DOMAINS.items():
-        # Compare header against all keywords in this domain
-        # extractOne returns (match, score)
-        match, score = process.extractOne(cleaned_header, keywords, scorer=fuzz.partial_token_sort_ratio)
-        
-        # We accumulate confidence. If a keyword matches strongly (>80), likely that domain.
-        if score > best_score:
-            best_score = score
-            best_domain = domain
-            
-    # Threshold: If score is too low, keep Uncategorized (Optional, currently greedy)
-    return best_domain if best_score > 60 else "Uncategorized"
-
-def score_value(val):
-    """Converts string/int input to 1-4 integer score."""
-    if pd.isna(val):
-        return 1
-    
-    s_val = str(val).lower().strip()
-    
-    # Direct fuzzy lookup in map could be safer, but direct dict check is fast
-    for key, score in LIKERT_MAP.items():
-        if key in s_val:
-            return score
-            
-    # Fallback try to extract first digit
+def score_text_to_int(value):
+    """Converts Likert scale text (e.g., '1 (Never/Rarely)') to an integer."""
+    if pd.isna(value):
+        return None
     try:
-        return int(re.search(r'\d+', s_val).group())
+        str_val = str(value).strip()
+        if str_val and str_val[0].isdigit():
+            return int(str_val[0])
+        return None
     except:
-        return 1
-
-def process_csv(uploaded_file):
-    """
-    The 'Brain': Cleans, Maps, and Scores the uploaded CSV.
-    Returns: Dict of Domain Scores, Dict of Comments
-    """
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"Error reading CSV: {e}")
         return None
 
+def clean_and_score(df, rater_name):
+    """Analyzes a raw dataframe using fuzzy matching to map columns to domains."""
     scores = {d: [] for d in DOMAINS.keys()}
-    comments = []
+    notes = []
 
-    # Identify Question Columns vs Timestamp/Score
     for col in df.columns:
-        # Skip metadata columns
-        if "timestamp" in col.lower() or "score" in col.lower() or "email" in col.lower() or "name" in col.lower():
-            continue
-            
-        # Check if it's a comment box
-        if "comment" in col.lower() or "note" in col.lower():
-            # Gather all non-empty comments
-            valid_comments = df[col].dropna().tolist()
-            comments.extend([str(c) for c in valid_comments if str(c).strip()])
-            continue
-
-        # Processing Rating Columns
-        cleaned = clean_header(col)
-        domain = map_domain(cleaned)
+        col_str = str(col)
         
-        if domain in scores:
-            # Convert column to numeric
-            numeric_col = df[col].apply(score_value)
-            # Add mean of this column to the domain list (or all values?)
-            # Prompt implies we need an aggregate score for the domain.
-            # Let's take the mean of the column (average frequency for that specific behavior across all rows if multiple entries, 
-            # but usually these are single student reports. Assuming 1 row per file for 'This Student')
-            
-            # If multiple rows (e.g. multiple teachers), we average them.
-            col_mean = numeric_col.mean()
-            scores[domain].append(col_mean)
+        # 1. Check for Qualitative Data
+        if any(x in col_str.lower() for x in ["note", "comment", "example", "elaborate"]):
+            valid_notes = df[col].dropna().astype(str).tolist()
+            if valid_notes:
+                notes.extend([f"- {n}" for n in valid_notes if len(n) > 3])
+            continue
 
-    # Calculate Final Domain Means
+        # 2. Fuzzy Match Column Header to Domains
+        best_domain = None
+        best_score = 0
+        
+        for domain, keywords in DOMAINS.items():
+            matches = process.extract(col_str, keywords, scorer=fuzz.partial_ratio, limit=1)
+            if matches:
+                keyword, score = matches[0][0], matches[0][1]
+                if score > 80: 
+                    if score > best_score:
+                        best_score = score
+                        best_domain = domain
+        
+        # 3. Process Scores
+        if best_domain:
+            numeric_values = df[col].apply(score_text_to_int).dropna()
+            scores[best_domain].extend(numeric_values.tolist())
+
+    # Calculate Averages
     final_scores = {}
-    for domain, values in scores.items():
-        if values:
-            final_scores[domain] = round(sum(values) / len(values), 2)
+    for domain, val_list in scores.items():
+        if val_list:
+            final_scores[domain] = round(sum(val_list) / len(val_list), 2)
         else:
-            final_scores[domain] = 0.0
+            final_scores[domain] = "N/A"
+            
+    return final_scores, "\n".join(notes)
 
-    return final_scores, "\n".join(comments)
+def create_docx(report_text):
+    """Generates a professional Word Document from the GPT report text."""
+    doc = Document()
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Calibri'
+    font.size = Pt(11)
 
-def generate_dummy_csv():
-    """Generates realistic dummy data for testing."""
-    data = {
-        "Timestamp": ["2023-10-27 10:00:00"],
-        "Student Name": ["Alex Doe"],
-        "How often does the student [Interrupts others]?": [random.choice(["Often", "Very Often"])],
-        "Rate frequency [Blurts out answers]": [random.choice(["Sometimes", "Often"])],
-        "Frequency [Difficulty transitioning]": [random.choice(["Often", "Very Often"])],
-        "Observe [Gets stuck on topics]": [random.choice(["Sometimes", "Rarely"])],
-        "Rate [Messy backpack]": [random.choice(["Very Often", "Often"])],
-        "Rate [Loses materials]": [4],
-        "Additional Comments": ["Struggles significantly with impulse control during math."]
-    }
-    return pd.DataFrame(data).to_csv(index=False).encode('utf-8')
+    doc.add_heading('Psychoeducational Evaluation Report', 0)
+    
+    for line in report_text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith('### '):
+            doc.add_heading(line.replace('### ', ''), level=3)
+        elif line.startswith('## '):
+            doc.add_heading(line.replace('## ', ''), level=2)
+        elif line.startswith('# '):
+            doc.add_heading(line.replace('# ', ''), level=1)
+        elif line.startswith('- ') or line.startswith('* '):
+            doc.add_paragraph(line[2:], style='List Bullet')
+        else:
+            clean_line = line.replace('**', '').replace('__', '')
+            doc.add_paragraph(clean_line)
+            
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
 
-# --- 4. SIDEBAR ---
+# -----------------------------------------------------------------------------
+# MAIN APP UI
+# -----------------------------------------------------------------------------
+
 with st.sidebar:
-    st.title("⚙️ Configuration")
-    
-    # API Key Input
-    api_key_input = st.text_input("OpenAI API Key", type="password", help="Required for report generation.")
-    if api_key_input:
-        st.session_state["api_key"] = api_key_input
-        
-    report_tone = st.selectbox("Report Tone", ["Clinical", "Parent-Friendly", "IEP-Focused"])
-    
-    st.info("🔒 **Privacy Mode**: Data is processed in-memory and wiped on refresh. No data is saved to any server.")
-    
+    st.title("Settings")
+    api_key = st.text_input("Enter your OpenAI API Key", type="password")
+    st.markdown("[Don't have a key? Get one at platform.openai.com](https://platform.openai.com)")
     st.divider()
-    
-    # Generate Sample Data
-    st.write("**New? Test with Sample Data:**")
-    if st.button("Generate Sample CSVs"):
-        csv_data = generate_dummy_csv()
-        st.download_button("Download Teacher Sample", csv_data, "teacher_sample.csv", "text/csv")
-        st.download_button("Download Parent Sample", csv_data, "parent_sample.csv", "text/csv")
-        st.download_button("Download Observer Sample", csv_data, "observer_sample.csv", "text/csv")
+    st.info("🔒 Privacy Mode: Data is processed in-memory and wiped on refresh. No data is stored.")
 
-# --- 5. MAIN INTERFACE ---
 st.title("🧠 PsychoReport.ai")
-st.markdown("### Executive Functioning Report Generator")
-st.markdown("Upload Google Form CSV exports to analyze Inhibition, Shift, and Organization domains.")
+st.markdown("### Automated Psychoeducational Reporting Tool")
+
+# --- FIXED: Added Student Name Input to prevent NameError ---
+student_name = st.text_input("Student Name (for Report Header)", placeholder="e.g. Alex M.")
+# -----------------------------------------------------------
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    teacher_file = st.file_uploader("Teacher Rating (CSV)", type=["csv"])
+    teacher_file = st.file_uploader("Teacher Data (CSV)", type="csv")
 with col2:
-    parent_file = st.file_uploader("Parent Rating (CSV)", type=["csv"])
+    parent_file = st.file_uploader("Parent Data (CSV)", type="csv")
 with col3:
-    observer_file = st.file_uploader("Observer Rating (CSV)", type=["csv"])
+    observer_file = st.file_uploader("Observer Data (CSV)", type="csv")
 
-# --- 6. DATA PROCESSING & VISUALIZATION ---
-if teacher_file or parent_file or observer_file:
-    st.divider()
-    st.subheader("📊 Domain Analysis")
-    
-    all_scores = []
-    
-    # Process Files
-    raters = {
-        "Teacher": teacher_file,
-        "Parent": parent_file, 
-        "Observer": observer_file
-    }
-    
-    aggregated_results = {} # Store for AI
+# -----------------------------------------------------------------------------
+# LOGIC ENGINE
+# -----------------------------------------------------------------------------
 
-    for rater_name, file in raters.items():
-        if file:
-            scores, comments = process_csv(file)
-            if scores:
-                aggregated_results[rater_name] = scores
-                # Prepare data for Plotly
-                for domain, score in scores.items():
-                    all_scores.append({"Rater": rater_name, "Domain": domain, "Score": score})
-
-    # Visualization
-    if all_scores:
-        df_viz = pd.DataFrame(all_scores)
+if st.button("Generate Report", type="primary"):
+    if not api_key:
+        st.error("⚠️ Authentication Error: Please provide an OpenAI API Key in the sidebar.")
+        st.stop()
         
-        # Grouped Bar Chart
-        fig = px.bar(
-            df_viz, 
-            x="Domain", 
-            y="Score", 
-            color="Rater", 
-            barmode="group",
-            range_y=[0, 4.5],
-            title="Cross-Informant Domain Comparison"
-        )
+    if not (teacher_file or parent_file or observer_file):
+        st.error("⚠️ Missing Data: Please upload at least one CSV file.")
+        st.stop()
         
-        # Clinical Significance Line
-        fig.add_hline(y=3.0, line_dash="dot", line_color="red", annotation_text="Clinical Significance (3.0)")
-        
-        st.plotly_chart(fig, use_container_width=True)
+    if not student_name:
+        st.warning("⚠️ Please enter a Student Name to generate the report.")
+        st.stop()
 
-    # --- 7. AI REPORT GENERATOR ---
-    st.divider()
-    col_gen, col_download = st.columns([1, 1])
-    
-    with col_gen:
-        generate_btn = st.button("📝 Generate Clinical Report", type="primary")
+    with st.spinner(f"Analyzing data for {student_name} and generating clinical report..."):
+        try:
+            data_context = f"Student Name: {student_name}\n"
+            
+            # Process Files
+            if teacher_file:
+                df_t = pd.read_csv(teacher_file)
+                scores_t, notes_t = clean_and_score(df_t, "Teacher")
+                data_context += f"\n--- TEACHER DATA ---\nScores (1-4): {scores_t}\nNotes:\n{notes_t}"
+            else:
+                data_context += "\n--- TEACHER DATA ---\n(Data not available)"
 
-    if generate_btn:
-        if not st.session_state["api_key"]:
-            st.error("Please enter your OpenAI API Key in the sidebar.")
-        else:
-            with st.spinner("Triangulating data and writing report..."):
-                try:
-                    client = OpenAI(api_key=st.session_state["api_key"])
-                    
-                    # Construct Prompt
-                    prompt_text = f"""
-                    You are a Licensed School Psychologist writing a formal psycho-educational report.
-                    Tone: {report_tone}.
-                    
-                    TASK: Write a triangulated Executive Functioning analysis based on the following data (Scale 1-4, >3.0 is clinically significant):
-                    {aggregated_results}
-                    
-                    STRUCTURE:
-                    1. Cross-Informant Analysis: Compare raters (Home vs School). Highlight discrepancies > 1.0 points.
-                    2. Domain Breakdown:
-                       - Inhibition
-                       - Shift/Flexibility
-                       - Organization/Planning
-                       (Label scores > 3.0 as "Clinically Significant Weakness")
-                    3. Recommendations: Provide 3 specific, classroom-based accommodations for the weakest area.
-                    
-                    Do not include a header or footer in the text, just the body content.
-                    """
+            if parent_file:
+                df_p = pd.read_csv(parent_file)
+                scores_p, notes_p = clean_and_score(df_p, "Parent")
+                data_context += f"\n--- PARENT DATA ---\nScores (1-4): {scores_p}\nNotes:\n{notes_p}"
+            else:
+                data_context += "\n--- PARENT DATA ---\n(Data not available)"
 
-                    response = client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {"role": "system", "content": "You are a helpful expert School Psychologist assistant."},
-                            {"role": "user", "content": prompt_text}
-                        ],
-                        stream=True
-                    )
-                    
-                    # Stream output
-                    report_container = st.empty()
-                    full_report = ""
-                    for chunk in response:
-                        if chunk.choices[0].delta.content:
-                            content = chunk.choices[0].delta.content
-                            full_report += content
-                            report_container.markdown(full_report)
-                            
-                    st.session_state["generated_report"] = full_report
-                    st.success("Report Generated!")
+            if observer_file:
+                df_o = pd.read_csv(observer_file)
+                scores_o, notes_o = clean_and_score(df_o, "Observer")
+                data_context += f"\n--- OBSERVER DATA ---\nScores (1-4): {scores_o}\nNotes:\n{notes_o}"
+            else:
+                data_context += "\n--- OBSERVER DATA ---\n(Data not available)"
 
-                except Exception as e:
-                    st.error(f"An error occurred: {e}")
+            # Prompt Construction
+            system_prompt = (
+                "You are a Licensed Educational Psychologist writing a formal psychoeducational evaluation. "
+                "Tone: Clinical, Objective, Professional. "
+                "Do not invent scores if they are missing (marked N/A)."
+            )
+            
+            user_prompt = f"""
+            Write a comprehensive evaluation report for: {student_name}.
+            
+            INPUT DATA:
+            {data_context}
+            
+            REQUIRED REPORT STRUCTURE (Use Markdown Headers):
+            
+            # Executive Functioning Profile: {student_name}
+            
+            # Cross-Contextual Analysis
+            Compare findings across settings (Home vs School). Highlight discrepancies.
+            
+            # Domain Analysis
+            ## Behavioral Regulation
+            Interpret the scores (1=Low Concern, 4=High Concern).
+            ## Cognitive Regulation
+            Interpret the scores.
+            ## Organization & Planning
+            Interpret the scores.
+            
+            # Recommendations
+            ## School-Based Interventions
+            Provide 3 specific strategies.
+            ## Home-Based Interventions
+            Provide 3 specific strategies.
+            """
 
-    # --- 8. WORD DOC EXPORT ---
-    if "generated_report" in st.session_state:
-        # Create Docx
-        doc = Document()
-        doc.add_heading("Confidential Psycho-Educational Report", 0)
-        doc.add_paragraph(st.session_state["generated_report"])
-        
-        footer = doc.sections[0].footer
-        p = footer.paragraphs[0]
-        p.text = "Generated by PsychoReport.ai. Draft only."
-        
-        # Save to buffer
-        buffer = BytesIO()
-        doc.save(buffer)
-        buffer.seek(0)
-        
-        with col_download:
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.7
+            )
+            
+            report_content = response.choices[0].message.content
+            
+            st.subheader("Generated Report")
+            st.text_area("Preview", value=report_content, height=600)
+            
+            docx_file = create_docx(report_content)
+            
             st.download_button(
-                label="📄 Download Word Doc",
-                data=buffer,
-                file_name="PsychoReport_Draft.docx",
+                label="📥 Download Report as Word Doc (.docx)",
+                data=docx_file,
+                file_name=f"PsychoReport_{student_name.replace(' ', '_')}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
+            
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
